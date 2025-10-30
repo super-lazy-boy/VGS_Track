@@ -1,1 +1,1 @@
-from .unimod1k import UniMod1K
+from .dataset import CustomDataset

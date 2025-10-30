@@ -1,307 +1,222 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-"""
-Backbone modules.
-"""
-import os.path
-import shutil
-import tarfile
-import tempfile
-
 import torch
-from pytorch_pretrained_bert import BertConfig, cached_path, CONFIG_NAME, WEIGHTS_NAME, load_tf_weights_in_bert
-from pytorch_pretrained_bert.modeling import BertLayerNorm, PRETRAINED_MODEL_ARCHIVE_MAP, logger, BERT_CONFIG_NAME, \
-    BertEmbeddings, BertEncoder
-from pytorch_pretrained_bert.modeling_transfo_xl import TF_WEIGHTS_NAME
-from torch import nn
-from typing import Dict, List
-from lib.utils.misc import NestedTensor
+import torch.nn as nn
+from typing import Dict, Any
+
+# 旧版 BERT 实现常用的库。你的环境里已经能 import pytorch_pretrained_bert，
+# 因为之前训练跑到 batch 500+ 时说明它是可用的。
+from pytorch_pretrained_bert import BertModel, BertTokenizer
 
 
-class BertPreTrainedModel(nn.Module):
-    """ An abstract class to handle weights initialization and
-        a simple interface for dowloading and loading pretrained checkpoints.
+class NestedTensor:
     """
-    def __init__(self, config, *inputs, **kwargs):
-        super(BertPreTrainedModel, self).__init__()
-        if not isinstance(config, BertConfig):
-            raise ValueError(
-                "Parameter config in `{}(config)` should be an instance of class `BertConfig`. "
-                "To create a model from a Google pretrained model use "
-                "`model = {}.from_pretrained(PRETRAINED_MODEL_NAME)`".format(
-                    self.__class__.__name__, self.__class__.__name__
-                ))
-        self.config = config
-
-    def init_bert_weights(self, module):
-        """ Initialize the weights.
-        """
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-        elif isinstance(module, BertLayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
-        """
-        Instantiate a BertPreTrainedModel from a pre-trained model file or a pytorch state dict.
-        Download and cache the pre-trained model file if needed.
-
-        Params:
-            pretrained_model_name_or_path: either:
-                - a str with the name of a pre-trained model to load selected in the list of:
-                    . `bert-base-uncased`
-                    . `bert-large-uncased`
-                    . `bert-base-cased`
-                    . `bert-large-cased`
-                    . `bert-base-multilingual-uncased`
-                    . `bert-base-multilingual-cased`
-                    . `bert-base-chinese`
-                - a path or url to a pretrained model archive containing:
-                    . `bert_config.json` a configuration file for the model
-                    . `pytorch_model.bin` a PyTorch dump of a BertForPreTraining instance
-                - a path or url to a pretrained model archive containing:
-                    . `bert_config.json` a configuration file for the model
-                    . `model.chkpt` a TensorFlow checkpoint
-            from_tf: should we load the weights from a locally saved TensorFlow checkpoint
-            cache_dir: an optional path to a folder in which the pre-trained checkpoints will be cached.
-            state_dict: an optional state dictionnary (collections.OrderedDict object) to use instead of Google pre-trained checkpoints
-            *inputs, **kwargs: additional input for the specific Bert class
-                (ex: num_labels for BertForSequenceClassification)
-        """
-        state_dict = kwargs.get('state_dict', None)
-        kwargs.pop('state_dict', None)
-        cache_dir = kwargs.get('cache_dir', None)
-        kwargs.pop('cache_dir', None)
-        from_tf = kwargs.get('from_tf', False)
-        kwargs.pop('from_tf', None)
-
-        if pretrained_model_name_or_path in PRETRAINED_MODEL_ARCHIVE_MAP:
-            archive_file = PRETRAINED_MODEL_ARCHIVE_MAP[pretrained_model_name_or_path]
-        else:
-            archive_file = pretrained_model_name_or_path
-        # redirect to the cache, if necessary
-        try:
-            resolved_archive_file = cached_path(archive_file, cache_dir=cache_dir)
-        except EnvironmentError:
-            logger.error(
-                "Model name '{}' was not found in model name list ({}). "
-                "We assumed '{}' was a path or url but couldn't find any file "
-                "associated to this path or url.".format(
-                    pretrained_model_name_or_path,
-                    ', '.join(PRETRAINED_MODEL_ARCHIVE_MAP.keys()),
-                    archive_file))
-            return None
-        if resolved_archive_file == archive_file:
-            logger.info("loading archive file {}".format(archive_file))
-        else:
-            logger.info("loading archive file {} from cache at {}".format(
-                archive_file, resolved_archive_file))
-        tempdir = None
-        if os.path.isdir(resolved_archive_file) or from_tf:
-            serialization_dir = resolved_archive_file
-        else:
-            # Extract archive to temp dir
-            tempdir = tempfile.mkdtemp()
-            logger.info("extracting archive file {} to temp dir {}".format(
-                resolved_archive_file, tempdir))
-            with tarfile.open(resolved_archive_file, 'r:gz') as archive:
-                archive.extractall(tempdir)
-            serialization_dir = tempdir
-        # Load config
-        config_file = os.path.join(serialization_dir, CONFIG_NAME)
-        if not os.path.exists(config_file):
-            # Backward compatibility with old naming format
-            config_file = os.path.join(serialization_dir, BERT_CONFIG_NAME)
-        config = BertConfig.from_json_file(config_file)
-        logger.info("Model config {}".format(config))
-        # Instantiate model.
-        model = cls(config, *inputs, **kwargs)
-        if state_dict is None and not from_tf:
-            weights_path = os.path.join(serialization_dir, WEIGHTS_NAME)
-            state_dict = torch.load(weights_path, map_location='cpu')
-        if tempdir:
-            # Clean up temp dir
-            shutil.rmtree(tempdir)
-        if from_tf:
-            # Directly load from a TensorFlow checkpoint
-            weights_path = os.path.join(serialization_dir, TF_WEIGHTS_NAME)
-            return load_tf_weights_in_bert(model, weights_path)
-        # Load from a PyTorch state_dict
-        old_keys = []
-        new_keys = []
-        for key in state_dict.keys():
-            new_key = None
-            if 'gamma' in key:
-                new_key = key.replace('gamma', 'weight')
-            if 'beta' in key:
-                new_key = key.replace('beta', 'bias')
-            if new_key:
-                old_keys.append(key)
-                new_keys.append(new_key)
-        for old_key, new_key in zip(old_keys, new_keys):
-            state_dict[new_key] = state_dict.pop(old_key)
-
-        missing_keys = []
-        unexpected_keys = []
-        error_msgs = []
-        # copy state_dict so _load_from_state_dict can modify it
-        metadata = getattr(state_dict, '_metadata', None)
-        state_dict = state_dict.copy()
-        if metadata is not None:
-            state_dict._metadata = metadata
-
-        def load(module, prefix=''):
-            local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
-            module._load_from_state_dict(
-                state_dict, prefix, local_metadata, True, missing_keys, unexpected_keys, error_msgs)
-            for name, child in module._modules.items():
-                if child is not None:
-                    load(child, prefix + name + '.')
-        start_prefix = ''
-        if not hasattr(model, 'bert') and any(s.startswith('bert.') for s in state_dict.keys()):
-            start_prefix = 'bert.'
-        load(model, prefix=start_prefix)
-        if len(missing_keys) > 0:
-            logger.info("Weights of {} not initialized from pretrained model: {}".format(
-                model.__class__.__name__, missing_keys))
-        if len(unexpected_keys) > 0:
-            logger.info("Weights from pretrained model not used in {}: {}".format(
-                model.__class__.__name__, unexpected_keys))
-        if len(error_msgs) > 0:
-            raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(
-                               model.__class__.__name__, "\n\t".join(error_msgs)))
-        return model
-
-
-class BertModel(BertPreTrainedModel):
-    """BERT model ("Bidirectional Embedding Representations from a Transformer").
-
-    Params:
-        config: a BertConfig class instance with the configuration to build a new model
-
-    Inputs:
-        `input_ids`: a torch.LongTensor of shape [batch_size, sequence_length]
-            with the word token indices in the vocabulary(see the tokens preprocessing logic in the scripts
-            `extract_features.py`, `run_classifier.py` and `run_squad.py`)
-        `token_type_ids`: an optional torch.LongTensor of shape [batch_size, sequence_length] with the token
-            types indices selected in [0, 1]. Type 0 corresponds to a `sentence A` and type 1 corresponds to
-            a `sentence B` token (see BERT paper for more details).
-        `attention_mask`: an optional torch.LongTensor of shape [batch_size, sequence_length] with indices
-            selected in [0, 1]. It's a mask to be used if the input sequence length is smaller than the max
-            input sequence length in the current batch. It's the mask that we typically use for attention when
-            a batch has varying length sentences.
-        `output_all_encoded_layers`: boolean which controls the content of the `encoded_layers` output as described below. Default: `True`.
-
-    Outputs: Tuple of (encoded_layers, pooled_output)
-        `encoded_layers`: controled by `output_all_encoded_layers` argument:
-            - `output_all_encoded_layers=True`: outputs a list of the full sequences of encoded-hidden-states at the end
-                of each attention block (i.e. 12 full sequences for BERT-base, 24 for BERT-large), each
-                encoded-hidden-state is a torch.FloatTensor of size [batch_size, sequence_length, hidden_size],
-            - `output_all_encoded_layers=False`: outputs only the full sequence of hidden-states corresponding
-                to the last attention block of shape [batch_size, sequence_length, hidden_size],
-        `pooled_output`: a torch.FloatTensor of size [batch_size, hidden_size] which is the output of a
-            classifier pretrained on top of the hidden state associated to the first character of the
-            input (`CLS`) to train on the Next-Sentence task (see BERT's paper).
-
-    Example usage:
-    ```python
-    # Already been converted into WordPiece token ids
-    input_ids = torch.LongTensor([[31, 51, 99], [15, 5, 0]])
-    input_mask = torch.LongTensor([[1, 1, 1], [1, 1, 0]])
-    token_type_ids = torch.LongTensor([[0, 0, 1], [0, 1, 0]])
-
-    config = modeling.BertConfig(vocab_size_or_config_json_file=32000, hidden_size=768,
-        num_hidden_layers=12, num_attention_heads=12, intermediate_size=3072)
-
-    model = modeling.BertModel(config=config)
-    all_encoder_layers, pooled_output = model(input_ids, token_type_ids, input_mask)
-    ```
+    保留一个 NestedTensor 壳以保持兼容。
+    视觉分支里 NestedTensor(tensors, mask)，mask=True 表示padding。
+    文本这边不直接用这个类训练，但其他模块可能会 from bert import NestedTensor，
+    所以别删它，避免 ImportError。
     """
-    def __init__(self, config):
-        super(BertModel, self).__init__(config)
-        self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
-        # self.pooler = BertPooler(config)
-        self.apply(self.init_bert_weights)
-
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, output_all_encoded_layers=True):
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        if token_type_ids is None:
-            token_type_ids = torch.zeros_like(input_ids)
-
-        # We create a 3D attention mask from a 2D tensor mask.
-        # Sizes are [batch_size, 1, 1, to_seq_length]
-        # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
-        # this attention mask is more simple than the triangular masking of causal attention
-        # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-
-        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-        # masked positions, this operation will create a tensor which is 0.0 for
-        # positions we want to attend and -10000.0 for masked positions.
-        # Since we are adding it to the raw scores before the softmax, this is
-        # effectively the same as removing these entirely.
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-
-        embedding_output = self.embeddings(input_ids, token_type_ids)
-        encoded_layers = self.encoder(embedding_output,
-                                      extended_attention_mask,
-                                      output_all_encoded_layers=output_all_encoded_layers)
-        # sequence_output = encoded_layers[-1]
-        # pooled_output = self.pooler(sequence_output)
-        if not output_all_encoded_layers:
-            encoded_layers = encoded_layers[-1]
-        return encoded_layers
+    def __init__(self, tensors, mask):
+        self.tensors = tensors
+        self.mask = mask
 
 
 class BERT(nn.Module):
-    def __init__(self, name: str, path: str, train_bert: bool, hidden_dim: int, max_len: int, enc_num):
+    """
+    我们自己的语言编码封装器。
+
+    目标：
+    - VGST.forward_language() 会像这样调用语言分支：
+        outputs = self.language_backbone(
+            token_ids=token_ids,
+            attention_mask=attn_mask
+        )
+
+      所以这里的 forward() 必须显式支持关键字参数 token_ids / attention_mask。
+
+    - dataloader 里给的文本张量是 (L, B) 形状，比如 (256, 1)：
+        nl_token_ids:   (256, 1)
+        nl_token_masks: (256, 1)
+      而 BertModel 期望 (B, L)。
+      我们需要自动把 (L,B) 转成 (B,L) 再喂进去。
+
+    - 返回值需要包含：
+        "lang_feats": [B, L, hidden_dim]  (hidden_dim=768 for bert-base)
+        "lang_mask":  [B, L]
+      这两个键在 VGST.forward_language() 里会被用来做 text_proj / 位置编码拼接。
+    """
+
+    def __init__(self, bert_model: BertModel, train_bert: bool, enc_num: int):
         super().__init__()
-        if name == 'bert-base-uncased':
-            self.num_channels = 768
-        else:
-            self.num_channels = 1024
-        self.enc_num = enc_num
-        if path is not None and os.path.exists(path):
-            print('Load pretrained BERT Done!')
-            self.bert = BertModel.from_pretrained(path)
-        else:
-            self.bert = BertModel.from_pretrained(name)
+        self.bert_model = bert_model
+        self.train_bert = train_bert
+        self.enc_num = enc_num  # 我们保留这个字段（用于调试/日志）
 
-        if not train_bert:
-            print('Language Model Bert has been frozen!')
-            for parameter in self.bert.parameters():
-                parameter.requires_grad_(False)
-        # print(self.bert)
+        # 如果 config 说不要 finetune BERT，就冻结它的参数
+        if not self.train_bert:
+            for p in self.bert_model.parameters():
+                p.requires_grad = False
 
-    def forward(self, tensor_list: NestedTensor):
+    def _batch_first(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        把 (L,B) 或 (B,L) 统一成 (B,L)。
 
-        if self.enc_num > 0:
-            all_encoder_layers = self.bert(tensor_list.tensors, token_type_ids=None, attention_mask=tensor_list.mask)
-            # use the output of the X-th transformer encoder layers
-            xs = all_encoder_layers[self.enc_num - 1]
-        else:
-            xs = self.bert.embeddings.word_embeddings(tensor_list.tensors)
-        mask = tensor_list.mask.to(torch.bool)
-        mask = ~mask
-        out = NestedTensor(xs, mask)
+        策略：
+        - 输入必须是 2D: [A,B]
+        - 如果 A > B，我们猜它是 (L,B)，就转置成 (B,L)
+          例如 (256,1) -> (1,256)
+        - 否则就保持不动，假定它已经是 (B,L)
 
+        这样可以兼容你的数据格式 (256,1) 以及一些未来可能的 (B,L) 格式。
+        """
+        if x.dim() != 2:
+            raise ValueError(
+                f"BERT.forward expects 2D tensors [*, *], got {tuple(x.shape)}"
+            )
+
+        if x.shape[0] > x.shape[1]:
+            # 例子: (256,1) -> (1,256)
+            x = x.transpose(0, 1).contiguous()
+        return x
+
+    def forward(self,
+                token_ids: torch.Tensor,
+                attention_mask: torch.Tensor) -> Dict[str, Any]:
+        """
+        Args:
+            token_ids:      Tensor (L,B) 或 (B,L), dtype=torch.long
+            attention_mask: Tensor (L,B) 或 (B,L), same shape logic
+
+            attention_mask 里通常是 1 表示“这个 token 有效 / 需要关注”，0 表示 padding。
+            我们保持这个约定，不在这里取反，保持和上游一致。
+
+        Returns:
+            {
+              "lang_feats": [B, L, hidden_dim],  # e.g. hidden_dim=768
+              "lang_mask":  [B, L]
+            }
+        """
+
+        # 1. 保证 batch 在第 0 维，即 [B,L]
+        input_ids = self._batch_first(token_ids)
+        attn_mask = self._batch_first(attention_mask)
+
+        # 2. 调用底层 BertModel
+        # pytorch_pretrained_bert.BertModel 的 forward 签名大致是：
+        #   sequence_output, pooled_output = bert_model(
+        #       input_ids,
+        #       token_type_ids=None,
+        #       attention_mask=attn_mask,
+        #       output_all_encoded_layers=False
+        #   )
+        #
+        # sequence_output: [B,L,hidden_dim]   (hidden_dim=768 for bert-base)
+        # pooled_output:   [B,hidden_dim]     (CLS向量)
+        sequence_output, pooled_output = self.bert_model(
+            input_ids,
+            token_type_ids=None,
+            attention_mask=attn_mask,
+            output_all_encoded_layers=False
+        )
+
+        # 3. 打包成 VGST 需要的 dict
+        out = {
+            "lang_feats": sequence_output,  # [B,L,hidden_dim]
+            "lang_mask": attn_mask          # [B,L]
+        }
         return out
 
 
+def _cfg_get(ns, candidates, default=None):
+    """
+    小工具：从一个 SimpleNamespace/对象 ns 里尝试多个字段名，
+    找到第一个存在的就返回，否则返回 default。
 
-# def build_bert(cfg):
-#     # position_embedding = build_position_encoding(cfg)
-#     train_bert = cfg.MODEL.LANGUAGE.BERT.LR > 0
-#     bert = BERT(cfg.MODEL.LANGUAGE.TYPE, cfg.MODEL.LANGUAGE.PATH, train_bert, cfg.MODEL.LANGUAGE.BERT.HIDDEN_DIM,
-#                 cfg.MODEL.LANGUAGE.BERT.MAX_QUERY_LEN, cfg.MODEL.LANGUAGE.BERT.ENC_NUM)
-#     # model = Joiner(bert, position_embedding)
-#     # model.num_channels = bert.num_channels
-#     return bert
+    例子：
+        model_name = _cfg_get(bert_cfg,
+                              ["TYPE", "MODEL", "NAME", "MODEL_NAME", "BERT_TYPE"],
+                              "bert-base-uncased")
+    """
+    for key in candidates:
+        if hasattr(ns, key):
+            return getattr(ns, key)
+    return default
+
+
+def build_bert(cfg) -> BERT:
+    """
+    构造语言分支编码器。
+
+    我们现在要做两件非常重要的事：
+    1. 兼容你的 cfg 结构（它是 types.SimpleNamespace），但是字段名不一定叫 TYPE。
+       有的仓库用 BERT.MODEL / BERT.NAME / BERT.TYPE…… 我们全都尝试。
+
+    2. 返回的对象要满足：
+       - .forward(token_ids=..., attention_mask=...) 可调用
+       - 输出 dict 里有 "lang_feats" 和 "lang_mask"
+       - 挂上一些属性（max_query_len, vocab, num_channels），主模型和上游代码可能会用
+
+    这样主模型 VGST 里的这段就可以直接跑：
+        outputs = self.language_backbone(token_ids=token_ids, attention_mask=attn_mask)
+        tgt_vl = self.text_proj(outputs["lang_feats"].transpose(0,1))
+        mask_vl = outputs["lang_mask"]
+        ...
+    """
+
+    # 取到语言分支 config namespace
+    bert_cfg = cfg.MODEL.LANGUAGE.BERT
+
+    # 1) 读模型名字（优先从 TYPE / MODEL / NAME / MODEL_NAME / BERT_TYPE 这些字段获取）
+    bert_type = _cfg_get(
+        bert_cfg,
+        ["TYPE", "MODEL", "NAME", "MODEL_NAME", "BERT_TYPE"],
+        "bert-base-uncased"  # fallback：常用预训练 BERT
+    )
+
+    # 2) 是否 finetune BERT (冻结与否)
+    train_bert = _cfg_get(
+        bert_cfg,
+        ["TRAIN_BERT", "FINETUNE", "FINE_TUNE", "TRAIN", "FINE_TUNE_BERT"],
+        False  # fallback: 默认不finetune，省内存/显存
+    )
+
+    # 3) 记录用到的层数/层号 (有的仓库叫 ENC_NUM)
+    enc_num = _cfg_get(
+        bert_cfg,
+        ["ENC_NUM", "NUM_LAYERS", "LAYERS"],
+        12  # fallback: bert-base 有12层
+    )
+
+    # 4) 最大文本长度（dataloader 通常会用这个截断）
+    max_query_len = _cfg_get(
+        bert_cfg,
+        ["MAX_QUERY_LEN", "MAX_LEN", "MAX_LENGTH", "MAX_TOKENS"],
+        256  # fallback: 256，对应你日志里 nl_token_ids 长度=256
+    )
+
+    # 5) BERT hidden size，用来告诉主干后面线性层该接多少输入通道
+    hidden_dim = _cfg_get(
+        bert_cfg,
+        ["HIDDEN_DIM", "DIM", "OUTPUT_DIM", "HIDDEN_SIZE"],
+        768  # fallback: bert-base hidden dim
+    )
+
+    # === 真正构建 tokenizer / bert_model ===
+    # 这会从本地 cache 里加载 'bert_type' 对应的预训练权重。
+    # 你的环境之前已经成功跑到 batch 500+，说明 pytorch_pretrained_bert
+    # 以及对应的权重是可用/可加载的，所以我们继续用这一套。
+    tokenizer = BertTokenizer.from_pretrained(bert_type)
+    bert_model = BertModel.from_pretrained(bert_type)
+
+    # === 包装成我们上面定义的 BERT 类（带 forward(token_ids=..., attention_mask=...)）===
+    bert_backbone = BERT(
+        bert_model=bert_model,
+        train_bert=train_bert,
+        enc_num=enc_num
+    )
+
+    # === 给上游（VGST / 数据管线）可能用到的属性 ===
+    # 这些字段名和之前版本保持一致，避免 AttributeError：
+    bert_backbone.max_query_len = max_query_len      # dataloader 可用来截断
+    bert_backbone.vocab = tokenizer.vocab            # 方便推理/调试
+    bert_backbone.num_channels = hidden_dim          # 语言特征原始通道（通常=768）
+
+    return bert_backbone

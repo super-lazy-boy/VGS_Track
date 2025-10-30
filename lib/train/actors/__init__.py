@@ -1,2 +1,2 @@
 from .base_actor import BaseActor
-from .spt import SPTSActor
+from .vgst_actor import VGSTActor

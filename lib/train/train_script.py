@@ -1,77 +1,79 @@
+import torch
 import os
-# loss function related
-from lib.utils.box_ops import giou_loss
-from torch.nn.functional import l1_loss
-from torch.nn import BCEWithLogitsLoss
-# train pipeline related
-from lib.train.trainers import LTRTrainer
-# distributed training related
-from torch.nn.parallel import DistributedDataParallel as DDP
-# some more advanced functions
-from .base_functions import *
-# network related
-from lib.models.spt import build_spt
-# forward propagation related
-from lib.train.actors import SPTActor
-# for import modules
-import importlib
-import collections
+
+from lib.train.base_functions import (
+    update_settings,
+    get_optimizer_scheduler,
+    build_dataloaders,
+)
+from lib.models.vgst.vgst import build_vgst
+from lib.train.trainers.trainer import build_vgst_trainer
+from lib.train.actors.vgst_actor import build_vgst_actor  # 你项目里的 actor
+# 注意：vgst_actor.py 负责把数据组织好并调用 net(...) 计算loss
 
 
 def run(settings):
-    settings.description = 'Training script for multi-modal SPT tracking method.'
+    """
+    真正的训练流程（student 模型）。
+    这里假设 run_training.py 已经：
+        - 构造了 Settings()
+        - settings.cfg = build_default_cfg()
+    所以我们只需要读取 settings.cfg，而不用再去解析 YAML 或其他外部配置文件。
+    """
 
-    # update the default configs with config file
-    if not os.path.exists(settings.cfg_file):
-        raise ValueError("%s doesn't exist." % settings.cfg_file)
-    config_module = importlib.import_module("lib.config.%s.config" % settings.script_name)
-    cfg = config_module.cfg
-    config_module.update_config_from_file(settings.cfg_file)
-    if settings.local_rank in [-1, 0]:
-        print("New configuration is shown below.")
-        for key in cfg.keys():
-            print("%s configuration:" % key, cfg[key])
-            print('\n')
+    # 一个简短的描述，Trainer 会写进 TensorBoard
+    settings.description = 'Training script for multi-modal VGST tracking.'
 
-    # update settings based on cfg
+    # 读取全局 cfg（所有模块共享的超参数）
+    cfg = settings.cfg
+
+    # 把 cfg 中的一些训练相关常量（例如打印间隔、grad clip）同步给 settings
     update_settings(settings, cfg)
 
-    # Record the training log
-    log_dir = os.path.join(settings.save_dir, 'logs')
-    if settings.local_rank in [-1, 0]:
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-    settings.log_file = os.path.join(log_dir, "%s-%s.log" % (settings.script_name, settings.config_name))
+    # --------------------------
+    # 1. 构建模型
+    # --------------------------
+    print("=> Building VGST model...")
+    net = build_vgst(cfg)  # 返回一个 VGST(nn.Module)
 
-    # Build dataloaders
-    loader_train = build_dataloaders(cfg, settings)
+    # DDP / 多GPU 支持
+    device = settings.device if hasattr(settings, 'device') else torch.device('cuda:0')
+    net = net.to(device)
 
-    if "RepVGG" in cfg.MODEL.BACKBONE.TYPE or "swin" in cfg.MODEL.BACKBONE.TYPE or "LightTrack" in cfg.MODEL.BACKBONE.TYPE:
-        cfg.ckpt_dir = settings.save_dir
+    # --------------------------
+    # 2. 构建数据加载器
+    # --------------------------
+    print("=> Building data loaders...")
+    loaders = build_dataloaders(cfg, settings)
 
-    # Create network
-    net = build_spt(cfg)
-
-    # wrap networks to distributed one
-    net.cuda()
-    if settings.local_rank != -1:
-        net = DDP(net, device_ids=[settings.local_rank], find_unused_parameters=True)
-        settings.device = torch.device("cuda:%d" % settings.local_rank)
-    else:
-        settings.device = torch.device("cuda:0")
-    settings.deep_sup = getattr(cfg.TRAIN, "DEEP_SUPERVISION", False)
-    settings.distill = getattr(cfg.TRAIN, "DISTILL", False)
-    settings.distill_loss_type = getattr(cfg.TRAIN, "DISTILL_LOSS_TYPE", "KL")
-
-    # Loss functions and Actors
-    objective = {'giou': giou_loss, 'l1': l1_loss}
-    loss_weight = {'giou': cfg.TRAIN.GIOU_WEIGHT, 'l1': cfg.TRAIN.L1_WEIGHT}
-    actor = SPTActor(net=net, objective=objective, loss_weight=loss_weight, settings=settings)
-
-    # Optimizer, parameters, and learning rates
+    # --------------------------
+    # 3. 构建优化器 & 学习率调度器
+    # --------------------------
+    print("=> Building optimizer and scheduler...")
     optimizer, lr_scheduler = get_optimizer_scheduler(net, cfg)
-    use_amp = getattr(cfg.TRAIN, "AMP", False)
-    trainer = LTRTrainer(actor, [loader_train], optimizer, settings, lr_scheduler, use_amp=use_amp)
 
-    # train process
-    trainer.train(cfg.TRAIN.EPOCH, load_latest=True, fail_safe=True)
+    # --------------------------
+    # 4. 构建 Actor 和 Trainer
+    # --------------------------
+    # Actor 负责：
+    #   - 前向传播调用 net(...)
+    #   - 计算 loss
+    #   - 返回 {loss总和, 各种分支loss统计}
+    print("=> Building actor and trainer...")
+    actor = build_vgst_actor(net, cfg)
+
+    trainer = build_vgst_trainer(
+        actor=actor,
+        loaders=loaders,
+        optimizer=optimizer,
+        settings=settings,
+        lr_scheduler=lr_scheduler,
+        use_amp=cfg.TRAIN.AMP
+    )
+
+    # --------------------------
+    # 5. 训练循环
+    # --------------------------
+    print("=> Start training loop.")
+    # trainer.train() 里会跑多个 epoch
+    trainer.train(cfg.TRAIN.EPOCH)
